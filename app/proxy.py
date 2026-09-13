@@ -14,10 +14,11 @@ import httpx
 LLAMA_BASE_URL = os.environ["LLAMA_BASE_URL"].rstrip("/")
 LLAMA_API_KEY = os.environ["LLAMA_API_KEY"]
 
-# Shared async client - connection pooling across requests
+# read matches llama-server's own --timeout (default 3600s) - large-context prompts
+# (100k+ tokens) can take minutes to prefill before the first byte comes back.
 _client = httpx.AsyncClient(
     base_url=LLAMA_BASE_URL,
-    timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=5.0),
+    timeout=httpx.Timeout(connect=10.0, read=3600.0, write=60.0, pool=5.0),
 )
 
 

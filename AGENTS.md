@@ -20,11 +20,13 @@ curl https://promptlyapi.com/v1/chat/completions \
   }'
 ```
 
-The `model` field is accepted but ignored; the server uses whichever model is loaded. The actual model name is returned in the response - query `/v1/models` for the current one.
+**Model selection:** the backend is multi-model. Omit `model` (or send `""`) to use the pinned default; send any name from `GET /v1/models` to use that specific model. The served model name is returned in the response.
 
-**Context window:** large (well over 100k tokens); the effective limit tracks the current deployment, so query `/v1/models` rather than hardcoding a value.
+**Latency:** the backend holds one model resident at a time. Requesting a different model than the one currently loaded pays that model's load time (a few seconds for small models, several minutes for the largest), and the first request after 5 minutes of silence is always a cold load. Clients that send many requests should stick to one model.
 
-**Reasoning:** the loaded model thinks by default and returns its chain-of-thought in a non-standard `reasoning_content` field (ignore it; read `content`). Thinking-control fields are forwarded to the model unchanged - the current Qwen model disables thinking with `chat_template_kwargs: {"enable_thinking": false}` and sets reasoning depth with `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}` (`none` errors - use `enable_thinking: false` to turn thinking off). A top-level `reasoning_effort` field is ignored by the current Qwen model - only the `chat_template_kwargs` form takes effect; harmony-style models (e.g. gpt-oss) use the top-level field instead.
+**Context window:** large (well over 100k tokens); the effective limit depends on the selected model, so query `/v1/models` rather than hardcoding a value.
+
+**Reasoning:** reasoning models think by default and return their chain-of-thought in a non-standard `reasoning_content` field (ignore it; read `content`). Thinking-control fields are forwarded to the model unchanged - Qwen models disable thinking with `chat_template_kwargs: {"enable_thinking": false}` and set reasoning depth with `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}` (`none` errors - use `enable_thinking: false` to turn thinking off). A top-level `reasoning_effort` field is ignored by Qwen models - only the `chat_template_kwargs` form takes effect; harmony-style models (e.g. gpt-oss) use the top-level field instead.
 
 ## Responses API (text profile)
 
@@ -44,7 +46,7 @@ This endpoint supports text-generation requests only. Multimodal input and tools
 
 Standard OpenAI shape. Always read `choices[0].message.content`.
 
-The loaded model is a reasoning model. Responses include a non-standard `reasoning_content` field; ignore it, it is the model's internal chain-of-thought, not the answer:
+The models in the catalog are reasoning models. Responses include a non-standard `reasoning_content` field; ignore it, it is the model's internal chain-of-thought, not the answer:
 
 ```json
 {
@@ -81,6 +83,7 @@ curl https://promptlyapi.com/v1/models \
 
 | Status | Meaning |
 |--------|---------|
+| 400 | Invalid request (malformed JSON, unknown model, unsupported field) |
 | 401 | Missing or invalid API key |
 | 402 | Token balance exhausted; purchase more at `https://promptlyapi.com/dashboard?key=sk-your-key` |
 | 429 | Rate limit exceeded (120 req/min per IP, 60 req/min per key) |

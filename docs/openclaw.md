@@ -72,12 +72,14 @@ openclaw models set promptly/default
 
 ## What you're actually talking to
 
-- **Model:** whichever model is currently loaded (query `/v1/models`); currently a Qwen3 reasoning model
-- **Reasoning:** the model thinks by default and returns its chain-of-thought in `reasoning_content`; those tokens bill the same as output. Disable thinking with `chat_template_kwargs: {"enable_thinking": false}`.
+- **Model:** the model you request. `promptly/default` maps to the pinned default model (currently a Qwen3 reasoning model); any other name from `GET /v1/models` selects that model instead.
+- **Reasoning:** reasoning models think by default and return their chain-of-thought in `reasoning_content`; those tokens bill the same as output. Disable thinking with `chat_template_kwargs: {"enable_thinking": false}`.
+
+**Latency note:** the backend holds one model resident at a time. Switching to a model that isn't currently loaded evicts it and pays the new model's load time (a few seconds for small models, several minutes for the largest ones), and the first request after 5 minutes of silence is always a cold load. Keep agents on `promptly/default` unless a specific model is worth the switch cost.
 
 ## Controlling reasoning
 
-The loaded model thinks by default. Disable it with `chat_template_kwargs: {"enable_thinking": false}`, or set reasoning depth with `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}`. (A top-level `reasoning_effort` field is ignored by the current Qwen model; only the `chat_template_kwargs` form takes effect.)
+The pinned default model thinks by default. Disable it with `chat_template_kwargs: {"enable_thinking": false}`, or set reasoning depth with `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}`. (A top-level `reasoning_effort` field is ignored by the Qwen models; only the `chat_template_kwargs` form takes effect.)
 
 OpenClaw's generic `openai-completions` provider route forwards `params.chat_template_kwargs` into the outbound request body (verified against 2026.9.2). Set it globally at `agents.defaults.models["promptly/default"].params.chat_template_kwargs`, or per agent:
 
@@ -175,6 +177,6 @@ Gotchas discovered along the way:
 
 ## Notes
 
-- Promptly ignores whatever `id` you send and always serves whichever model is currently loaded, so `"id": "default"` above will keep working if the backend model changes.
+- The `model` field is honored: `"id": "default"` maps to the pinned default model and will keep working if the backend catalog changes. Other names select specific models from `GET /v1/models` (with a load delay on first switch).
 - Check your token balance any time at `https://promptlyapi.com/dashboard?key=sk-your-key-here`.
 - OpenClaw's security model treats inbound messages (from WhatsApp, Telegram, etc.) as untrusted input by default - see OpenClaw's [security guide](https://docs.openclaw.ai/gateway/security) before connecting other users or exposing your Gateway remotely. This is independent of Promptly and applies regardless of which model provider you use.

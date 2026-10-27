@@ -36,17 +36,18 @@ async def create_checkout_session(
     pack_id: str,
     user_id: int,
     user_email: str,
-    full_key: str,
-    base_url: str,
+    success_url: str,
+    cancel_url: str,
 ) -> str:
     '''Create a hosted Stripe Checkout Session for the given token pack.
 
     Args:
         pack_id: Key in PACK_CATALOG (e.g. "5m", "25m", "100m").
-        user_id: Database ID of the purchasing user.
+        user_id: Database ID of the purchasing user (stored in metadata).
         user_email: Pre-fills the Stripe Checkout email field.
-        full_key: Full API key, embedded in the success redirect URL.
-        base_url: Public base URL of this gateway (e.g. https://example.com).
+        success_url: Where Stripe redirects after payment. Must NOT contain
+            the user's API key - use the short-lived return token flow.
+        cancel_url: Where Stripe redirects if the user abandons checkout.
 
     Returns:
         The hosted Stripe Checkout URL to redirect the user to.
@@ -85,8 +86,8 @@ async def create_checkout_session(
                     'pack_id': pack_id,
                     'tokens': str(pack['tokens']),
                 },
-                'success_url': f'{base_url}/dashboard?key={full_key}&payment=success',
-                'cancel_url': f'{base_url}/dashboard?key={full_key}',
+                'success_url': success_url,
+                'cancel_url': cancel_url,
             }
         )
         return session.url

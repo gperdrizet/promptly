@@ -127,16 +127,23 @@ Not currently enabled:
 
 Unsupported features are rejected with a clear `400` error instead of being silently ignored.
 
-### Model name and response format
+### Model selection
 
-The `model` field in your request is accepted but ignored; the server always uses whichever model is currently loaded. The deployed model and its runtime limits change as the backend is tuned, so query them live rather than hardcoding - the current model name is returned by:
+Promptly fronts a multi-model inference backend. The `model` field selects which model serves your request:
+
+- **Omit it** (or send `""`) - the pinned default model is served.
+- **Send any model name listed by `GET /v1/models`** - that model is served.
+
+Query the live list rather than hardcoding, since the catalog changes as the backend is tuned:
 
 ```bash
 curl https://promptlyapi.com/v1/models \
   -H "Authorization: Bearer sk-your-key-here"
 ```
 
-The currently loaded model is a reasoning model that thinks by default. How you control thinking is model-specific and forwarded to the backend unchanged: the current Qwen model disables thinking via `chat_template_kwargs: {"enable_thinking": false}` and sets reasoning depth via `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}`, while harmony-style models (e.g. gpt-oss) use a top-level `reasoning_effort` field. Control fields a model doesn't recognize are ignored - the current Qwen model ignores the top-level `reasoning_effort` field, so use the `chat_template_kwargs` forms above. Thinking output appears in the `reasoning_content` field (below) and bills as normal output tokens.
+**Latency note:** the backend holds one model resident at a time. Requesting a different model than the one currently loaded evicts it and pays the new model's load time (a few seconds for small models, several minutes for the largest ones). The first request after 5 minutes of silence always pays a cold load. The default model is the resident workhorse; heavy model switching is best avoided by clients that send many requests.
+
+**Reasoning / thinking:** reasoning models think by default and return their chain-of-thought in a non-standard `reasoning_content` field (below), which bills as normal output tokens. Thinking-control fields are forwarded to the backend unchanged and are model-specific: Qwen models disable thinking with `chat_template_kwargs: {"enable_thinking": false}` and set reasoning depth with `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}`, while harmony-style models (e.g. gpt-oss) use a top-level `reasoning_effort` field. Control fields a model doesn't recognize are ignored - the Qwen models ignore the top-level `reasoning_effort` field, so use the `chat_template_kwargs` forms for them.
 
 Responses include a non-standard `reasoning_content` field alongside the standard `content` field:
 
@@ -195,13 +202,13 @@ docker compose up --build
 pytest tests/ -v
 ```
 
-Tests use an in-memory SQLite database; no Docker required. All 17 tests should pass.
+Tests use an in-memory SQLite database; no Docker required. The full suite should pass.
 
 ## Deployment
 
 ### Infrastructure
 
-- **Model server**: runs llama-server on `:8502`, accessible over a private WireGuard tunnel
+- **Model server**: multi-model llama.cpp router on `:8502`, accessible over a private WireGuard tunnel
 - **Gateway server**: VPS running nginx + Docker; model-gateway runs here behind nginx
 
 ### Production stack on the gateway server
@@ -447,8 +454,10 @@ A separate compose stack (`docker-compose.btcpay.yml`) runs BTCPay Server bound 
 
 ## Token packs
 
-| Pack | Tokens | Price |
+| Pack id | Tokens | Price |
 |---|---|---|
-| `starter` | 5M | $0.50 |
-| `standard` | 25M | $2.00 |
-| `pro` | 100M | $6.00 |
+| `5m` | 5M | $0.50 |
+| `25m` | 25M | $2.00 |
+| `100m` | 100M | $6.00 |
+
+Top-ups are currently **disabled in the UI** (the buy buttons show "Coming soon"); the packs above are the catalog that will be offered.

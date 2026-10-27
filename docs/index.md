@@ -30,12 +30,18 @@ Authorization: Bearer sk-<your-key>
 - `GET /v1/models`
 - `GET /health`
 
-## Current deployment
+## Model selection
 
-The deployed model and its runtime limits (context window, slots) change as the backend is tuned, so query them live rather than relying on a fixed value:
+Promptly fronts a multi-model inference backend. The `model` field selects which model serves your request:
 
-- Current model name: `GET /v1/models`
-- Reasoning: the model thinks by default and returns its chain-of-thought in a non-standard `reasoning_content` field. On the current Qwen model, set reasoning depth with `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}` or disable thinking with `chat_template_kwargs: {"enable_thinking": false}` (a top-level `reasoning_effort` field is ignored).
+- **Omit it** (or send `""`) - the pinned default model is served.
+- **Send any model name listed by `GET /v1/models`** - that model is served.
+
+Query the live list rather than hardcoding, since the catalog changes as the backend is tuned.
+
+**Latency note:** the backend holds one model resident at a time. Requesting a different model than the one currently loaded evicts it and pays the new model's load time (a few seconds for small models, several minutes for the largest ones), and the first request after 5 minutes of silence is always a cold load. The default model is the resident workhorse; clients that send many requests should stick to one model.
+
+**Reasoning:** the models in the catalog are reasoning models. They think by default and return their chain-of-thought in a non-standard `reasoning_content` field (billed as regular output). Thinking-control fields are forwarded to the backend unchanged and are model-specific: Qwen models use `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}` to set reasoning depth and `chat_template_kwargs: {"enable_thinking": false}` to turn thinking off (a top-level `reasoning_effort` field is ignored by them); harmony-style models (e.g. gpt-oss) use the top-level field instead.
 
 ## Example use cases
 

@@ -32,7 +32,7 @@ curl https://promptlyapi.com/v1/responses \
 
 ## Notes on model name and output
 
-- The `model` field is accepted but the server runs whichever model is currently loaded.
-- Use `GET /v1/models` to discover the active model name.
+- The `model` field selects the model: omit it (or send `""` / `default`) for the pinned default, or send any name from `GET /v1/models`.
+- The backend holds one model resident at a time; switching models pays the new model's load time, and the first request after 5 minutes of silence is a cold load.
 - For chat completions, read `choices[0].message.content`.
 - Responses may include non-standard provider fields, such as `reasoning_content` in chat payloads.

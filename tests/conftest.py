@@ -12,7 +12,6 @@ from httpx import AsyncClient, ASGITransport
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("LLAMA_BASE_URL", "http://llama-mock")
 os.environ.setdefault("LLAMA_API_KEY", "test-llama-key")
-os.environ.setdefault("GATEWAY_SECRET_KEY", "test-secret-key-32-chars-exactly!")
 os.environ.setdefault("STRIPE_SECRET_KEY", "sk_test_placeholder")
 os.environ.setdefault("STRIPE_WEBHOOK_SECRET", "whsec_placeholder")
 os.environ.setdefault("BTCPAY_URL", "http://placeholder")
@@ -54,6 +53,9 @@ async def _db_session():
     gateway_app._reg_attempts.clear()
     gateway_app._reg_burst_attempts.clear()
     gateway_app._reg_captcha_challenges.clear()
+    gateway_app._ip_inf_attempts.clear()
+    gateway_app._user_inf_attempts.clear()
+    gateway_app._last_limiter_sweep.clear()
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -64,6 +66,9 @@ async def _db_session():
     gateway_app._reg_attempts.clear()
     gateway_app._reg_burst_attempts.clear()
     gateway_app._reg_captcha_challenges.clear()
+    gateway_app._ip_inf_attempts.clear()
+    gateway_app._user_inf_attempts.clear()
+    gateway_app._last_limiter_sweep.clear()
 
 
 @pytest_asyncio.fixture(scope='function')
@@ -80,7 +85,7 @@ async def client(_db_session):
 
 @pytest_asyncio.fixture(scope='function')
 async def registered_user(_db_session):
-    '''Create a real user with 100k trial tokens and return their credentials.
+    '''Create a real user with 500k trial tokens and return their credentials.
 
     Yields:
         A dict with keys: id, email, key, prefix.

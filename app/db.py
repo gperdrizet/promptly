@@ -14,7 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import (
-    BigInteger, DateTime, ForeignKey, Integer, String, Text
+    BigInteger, DateTime, ForeignKey, Integer, String, Text, select
 )
 
 # SQLite (used in tests) requires INTEGER for autoincrement primary keys;
@@ -186,22 +186,13 @@ async def get_user_by_key_prefix(session: AsyncSession, prefix: str) -> User | N
         The matching User, or None if not found.
     '''
 
+    # api_key_prefix is 12 chars of a 48-char URL-safe token; collisions
+    # are not expected, and .first() handles the (never) duplicate case.
     result = await session.execute(
-        text("SELECT * FROM users WHERE api_key_prefix = :prefix"),
-        {"prefix": prefix},
+        select(User).where(User.api_key_prefix == prefix)
     )
 
-    rows = result.mappings().all()
-
-    if not rows:
-        return None
-
-    # There should only ever be one, but handle duplicates defensively
-    from sqlalchemy import select
-    stmt = select(User).where(User.api_key_prefix == prefix)
-    users = (await session.execute(stmt)).scalars().all()
-
-    return users[0] if users else None
+    return result.scalars().first()
 
 
 async def get_active_trial_tokens(session: AsyncSession, user_id: int) -> int:
@@ -224,62 +215,97 @@ async def get_active_trial_tokens(session: AsyncSession, user_id: int) -> int:
         {"uid": user_id, "now": now},
     )
 
-    return result.scalar()
+    return int(result.scalar() or 0)
 
 
 async def deduct_tokens(
     session: AsyncSession, user: User, total_tokens: int
-) -> None:
+) -> int:
     '''Deduct tokens from trial balance first, then paid balance.
 
-    Modifies trial grant rows and the user's balance_tokens in place.
+    The user's trial rows (and the user row, if paid balance is touched)
+    are locked for the duration of the caller's transaction on Postgres,
+    so concurrent billing for the same user sees each other's committed
+    state and no balance can be driven below zero. On SQLite (tests) the
+    write path is serialized at the database level, so no lock clause is
+    emitted.
+
+    If the available balance is less than total_tokens, the deduction is
+    capped at what is available (graceful overdraw: the request was
+    already served, so the shortfall is not billed).
+
     Does not commit; the caller is responsible for committing.
 
     Args:
         session: Active SQLAlchemy async session.
         user: The User ORM object whose balance will be reduced.
         total_tokens: Total number of tokens to deduct.
+
+    Returns:
+        Number of tokens actually deducted (may be less than total_tokens).
     '''
 
-    now = datetime.now(timezone.utc)
+    if total_tokens <= 0:
+        return 0
 
-    # Deduct from active trial grants (oldest first)
-    if total_tokens > 0:
-        result = await session.execute(
+    # Row-level locks only make sense on Postgres; SQLite has no FOR
+    # UPDATE syntax (and the in-memory test DB serializes writes anyway).
+    lock = " FOR UPDATE" if session.bind.dialect.name == "postgresql" else ""
+
+    now = datetime.now(timezone.utc)
+    remaining = total_tokens
+    deducted = 0
+
+    # Deduct from active trial grants first (oldest expiring first -
+    # trial tokens die, paid tokens don't).
+    result = await session.execute(
+        text(
+            "SELECT id, remaining_tokens FROM trial_tokens "
+            "WHERE user_id = :uid AND expires_at > :now AND remaining_tokens > 0 "
+            "ORDER BY expires_at ASC" + lock
+        ),
+        {"uid": user.id, "now": now},
+    )
+
+    for row in result.mappings().all():
+        if remaining <= 0:
+            break
+
+        deduct = min(remaining, row["remaining_tokens"])
+        await session.execute(
             text(
-                "SELECT id, remaining_tokens FROM trial_tokens "
-                "WHERE user_id = :uid AND expires_at > :now AND remaining_tokens > 0 "
-                "ORDER BY expires_at ASC"
+                "UPDATE trial_tokens SET remaining_tokens = remaining_tokens - :d, "
+                "activated_at = COALESCE(activated_at, :now) "
+                "WHERE id = :id"
             ),
-            {"uid": user.id, "now": now},
+            {"d": deduct, "now": now, "id": row["id"]},
         )
 
-        trial_rows = result.mappings().all()
+        remaining -= deduct
+        deducted += deduct
 
-        for row in trial_rows:
-            if total_tokens <= 0:
-                break
+    # Deduct remainder from paid balance (locked row, capped at balance).
+    if remaining > 0:
+        result = await session.execute(
+            text("SELECT balance_tokens FROM users WHERE id = :id" + lock),
+            {"id": user.id},
+        )
+        paid = result.scalar() or 0
+        paid = max(paid, 0)
 
-            deduct = min(total_tokens, row["remaining_tokens"])
+        deduct = min(remaining, paid)
+        if deduct > 0:
             await session.execute(
-                text(
-                    "UPDATE trial_tokens SET remaining_tokens = remaining_tokens - :d, "
-                    "activated_at = COALESCE(activated_at, :now) "
-                    "WHERE id = :id"
-                ),
-                {"d": deduct, "now": now, "id": row["id"]},
+                text("UPDATE users SET balance_tokens = balance_tokens - :d WHERE id = :id"),
+                {"d": deduct, "id": user.id},
             )
 
-            total_tokens -= deduct
+        # Keep the ORM object in sync with the raw UPDATE so the session
+        # flush doesn't clobber the stored balance.
+        user.balance_tokens = paid - deduct
+        deducted += deduct
 
-    # Deduct remainder from paid balance
-    if total_tokens > 0:
-        await session.execute(
-            text("UPDATE users SET balance_tokens = balance_tokens - :d WHERE id = :id"),
-            {"d": total_tokens, "id": user.id},
-        )
-
-        user.balance_tokens -= total_tokens
+    return deducted
 
 
 async def total_available_tokens(session: AsyncSession, user: User) -> int:

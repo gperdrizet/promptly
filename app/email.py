@@ -16,7 +16,7 @@ SMTP_USER = os.environ['SMTP_USER']
 SMTP_PASSWORD = os.environ['SMTP_PASSWORD']
 SMTP_FROM = os.environ['SMTP_FROM']
 BASE_URL = os.environ.get('BASE_URL', '')
-TRIAL_TOKENS = int(os.environ.get('TRIAL_TOKENS', '100000'))
+TRIAL_TOKENS = int(os.environ.get('TRIAL_TOKENS', '1000000'))
 TRIAL_EXPIRY_DAYS = int(os.environ.get('TRIAL_EXPIRY_DAYS', '7'))
 
 
@@ -57,7 +57,7 @@ To make your first request:
         "messages": [{{"role": "user", "content": "Hello!"}}]
       }}'
 
-View your usage and buy more tokens:
+View your usage and balance:
     {BASE_URL}/dashboard?key={api_key}
 
 Questions? Just reply to this email.
@@ -98,7 +98,7 @@ Questions? Just reply to this email.
   }}'</pre>
 
   <p>
-    <a href="{BASE_URL}/dashboard?key={api_key}">View your usage and buy more tokens →</a>
+    <a href="{BASE_URL}/dashboard?key={api_key}">View your usage and balance →</a>
   </p>
 
   <p class="note">Questions? Reply to this email.</p>

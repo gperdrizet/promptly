@@ -148,7 +148,12 @@
 <body>
 <div class="wrap">
   <h1>Dashboard</h1>
-  <p class="email">{{ email }}</p>
+  <p class="email">
+    {{ email }}
+    <form method="post" action="/dashboard/logout" style="display:inline">
+      <button type="submit" style="background:none;border:none;color:#aaa;font-size:0.9rem;cursor:pointer;padding:0 0 0 12px">Sign out</button>
+    </form>
+  </p>
 
   {# Payment success banner #}
   {% if payment_success %}
@@ -219,16 +224,15 @@
         <div class="tokens">{{ pack.label }}</div>
         <div class="price">${{ pack.price }}</div>
         <div class="cpp">${{ pack.cpp }}/1M tokens</div>
-        <form method="get" action="/checkout" style="margin:0;display:flex;gap:6px;flex-wrap:wrap">
+        <form method="post" action="/checkout" style="margin:0;display:flex;gap:6px;flex-wrap:wrap">
           <input type="hidden" name="pack" value="{{ pack.id }}">
-          <input type="hidden" name="key" value="{{ api_key }}">
           <button type="submit" name="method" value="stripe" class="pack-btn" style="flex:1" disabled title="Coming soon">Card</button>
           <button type="submit" name="method" value="btcpay" class="pack-btn" style="flex:1;background:#f7931a;color:#fff" disabled title="Coming soon">₿ BTC</button>
         </form>
       </div>
       {% endfor %}
     </div>
-    <p class="pay-methods">Accepts card (Stripe) · Bitcoin · Ethereum</p>
+    <p class="pay-methods">Accepts card (Stripe) · Bitcoin (BTCPay)</p>
     <p class="coming-soon">Top-ups are coming soon &mdash; not yet available.</p>
   </div>
 

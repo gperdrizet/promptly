@@ -18,6 +18,7 @@ Example:
 '''
 
 import argparse
+import http.cookiejar
 import os
 import re
 import sys
@@ -145,10 +146,16 @@ def request(
         req.add_header('Content-Type', 'application/x-www-form-urlencoded')
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # Shared cookie jar: the dashboard login (?key=) sets a session
+        # cookie that the followed redirect needs.
+        with _opener.open(req, timeout=timeout) as resp:
             return resp.status, resp.read(), dict(resp.headers)
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read(), dict(exc.headers)
+
+
+_cookie_jar = http.cookiejar.CookieJar()
+_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cookie_jar))
 
 
 # --- Test cases ---
@@ -314,7 +321,8 @@ def test_grant_and_infer(
 
 
 def test_dashboard(base: str, api_key: str, email: str, verbose: bool) -> bool:
-    '''GET /dashboard?key=... returns 200 and shows the dashboard page.'''
+    '''GET /dashboard?key=... establishes a session (one-time key login) and
+    the redirected request renders the dashboard page.'''
 
     status, body, _ = request(f'{base}/dashboard?key={api_key}')
 

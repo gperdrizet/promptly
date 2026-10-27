@@ -12,12 +12,9 @@ import re
 import secrets
 import time
 from ipaddress import ip_address, ip_network
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-log = logging.getLogger(__name__)
 
 import aiosmtplib
 import httpx
@@ -40,6 +37,8 @@ from .checkout import create_checkout_session, verify_webhook
 from .db import TokenPurchase
 from .email import send_trial_key_email, TRIAL_TOKENS, TRIAL_EXPIRY_DAYS
 from .proxy import proxy_request, proxy_stream
+
+log = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -71,13 +70,14 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ''
 
 # Simple in-memory rate limit for registration: max attempts per IP per hour.
-# Override via REGISTRATION_RATE_LIMIT env var.
-_reg_attempts: dict[str, list[float]] = defaultdict(list)
+# Override via REGISTRATION_RATE_LIMIT env var. Stale keys are swept by
+# _check_rate_limit() so these stores stay bounded.
+_reg_attempts: dict[str, list[float]] = {}
 REG_LIMIT = int(os.environ.get('REGISTRATION_RATE_LIMIT', '3'))
 REG_WINDOW = int(os.environ.get('REGISTRATION_RATE_WINDOW', '3600'))
 
 # Shorter burst window to slow down repeated spam submissions.
-_reg_burst_attempts: dict[str, list[float]] = defaultdict(list)
+_reg_burst_attempts: dict[str, list[float]] = {}
 REG_BURST_LIMIT = int(os.environ.get('REGISTRATION_BURST_LIMIT', '2'))
 REG_BURST_WINDOW = int(os.environ.get('REGISTRATION_BURST_WINDOW', '600'))
 
@@ -88,16 +88,29 @@ _CAPTCHA_TTL = int(os.environ.get('REGISTRATION_CAPTCHA_TTL', '300'))
 
 # Per-IP rate limit on all /v1/* hits (catches unauthenticated hammering).
 # Generous enough to allow multiple real users behind the same NAT.
-_ip_inf_attempts: dict[str, list[float]] = defaultdict(list)
+_ip_inf_attempts: dict[str, list[float]] = {}
 INF_IP_LIMIT = int(os.environ.get('INFERENCE_IP_RATE_LIMIT', '120'))
 INF_IP_WINDOW = 60  # seconds
 
 # Per-user rate limit on authenticated inference requests.
 # Catches accidental infinite loops. LLM calls take seconds each, so 60/min
 # is generous for legitimate use while blocking runaway loops immediately.
-_user_inf_attempts: dict[str, list[float]] = defaultdict(list)
+_user_inf_attempts: dict[str, list[float]] = {}
 INF_USER_LIMIT = int(os.environ.get('INFERENCE_USER_RATE_LIMIT', '60'))
 INF_USER_WINDOW = 60  # seconds
+
+# Pinned default model: served when clients omit the `model` field (or send
+# an empty one). The backend router defines a matching `default` alias that
+# mirrors the pinned model - see llama.cpp utils/agent-router.ini.
+DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'default')
+
+# Optional public model allow-list (comma-separated router aliases). When
+# unset, any alias the router knows is accepted (the router rejects unknown
+# ones itself). When set, requests naming a model outside the list get a
+# clear 400 from the gateway - use this to gate which models are public.
+_MODEL_ALLOWLIST = {
+    m.strip() for m in os.environ.get('MODEL_ALLOWLIST', '').split(',') if m.strip()
+}
 
 # Lightweight email validation for public signup.
 _EMAIL_RE = re.compile(
@@ -130,41 +143,56 @@ def _is_valid_email(email: str) -> bool:
     return True
 
 
-def _check_reg_rate_limit(ip: str) -> bool:
-    '''Check per-IP rate limit for registration attempts.
+# Periodic sweep so the rate-limiter stores stay bounded: a key whose entire
+# window has passed (or whose list went empty) is dropped, at most once per
+# interval per store.
+_last_limiter_sweep: dict[int, float] = {}  # id(store) -> last sweep time
+_LIMITER_SWEEP_INTERVAL = 60  # seconds
+
+
+def _check_rate_limit(store: dict, key: str, limit: int, window: float) -> bool:
+    '''Check a sliding-window rate limit and record the request.
 
     Args:
-        ip: Client IP address string.
+        store: Module-level mapping of limit key -> request timestamps.
+        key: The limit key (client IP or API key prefix).
+        limit: Maximum requests allowed within the window.
+        window: Window length in seconds.
 
     Returns:
         True if the request is within the limit, False if rate-limited.
     '''
 
     now = time.time()
-    attempts = [t for t in _reg_attempts[ip] if now - t < REG_WINDOW]
-    _reg_attempts[ip] = attempts
 
-    if len(attempts) >= REG_LIMIT:
+    # A stale key is only ever re-checked if its owner retries, so sweep the
+    # whole store periodically to keep it from growing without bound as new
+    # IPs and users come and go.
+    if now - _last_limiter_sweep.get(id(store), 0.0) >= _LIMITER_SWEEP_INTERVAL:
+        _last_limiter_sweep[id(store)] = now
+        stale = [k for k, ts in store.items() if not ts or now - ts[-1] >= window]
+        for stale_key in stale:
+            del store[stale_key]
+
+    attempts = [t for t in store.get(key, ()) if now - t < window]
+
+    if len(attempts) >= limit:
+        store[key] = attempts
         return False
 
-    _reg_attempts[ip].append(now)
-
+    attempts.append(now)
+    store[key] = attempts
     return True
+
+
+def _check_reg_rate_limit(ip: str) -> bool:
+    '''Check per-IP rate limit for registration attempts.'''
+    return _check_rate_limit(_reg_attempts, ip, REG_LIMIT, REG_WINDOW)
 
 
 def _check_reg_burst_rate_limit(ip: str) -> bool:
     '''Check a short burst window for registration attempts.'''
-
-    now = time.time()
-    attempts = [t for t in _reg_burst_attempts[ip] if now - t < REG_BURST_WINDOW]
-    _reg_burst_attempts[ip] = attempts
-
-    if len(attempts) >= REG_BURST_LIMIT:
-        return False
-
-    _reg_burst_attempts[ip].append(now)
-
-    return True
+    return _check_rate_limit(_reg_burst_attempts, ip, REG_BURST_LIMIT, REG_BURST_WINDOW)
 
 
 def _prune_captcha_challenges(now: float | None = None) -> None:
@@ -234,47 +262,13 @@ def _render_register_page(request: Request, error: str | None = None, *, status_
 
 
 def _check_ip_inference_rate_limit(ip: str) -> bool:
-    '''Check per-IP rate limit for inference requests.
-
-    Args:
-        ip: Client IP address string.
-
-    Returns:
-        True if within the limit, False if rate-limited.
-    '''
-
-    now = time.time()
-    attempts = [t for t in _ip_inf_attempts[ip] if now - t < INF_IP_WINDOW]
-    _ip_inf_attempts[ip] = attempts
-
-    if len(attempts) >= INF_IP_LIMIT:
-        return False
-
-    _ip_inf_attempts[ip].append(now)
-
-    return True
+    '''Check per-IP rate limit for inference requests.'''
+    return _check_rate_limit(_ip_inf_attempts, ip, INF_IP_LIMIT, INF_IP_WINDOW)
 
 
 def _check_user_inference_rate_limit(prefix: str) -> bool:
-    '''Check per-user rate limit for inference requests.
-
-    Args:
-        prefix: API key prefix (first 12 chars), used as the per-user key.
-
-    Returns:
-        True if within the limit, False if rate-limited.
-    '''
-
-    now = time.time()
-    attempts = [t for t in _user_inf_attempts[prefix] if now - t < INF_USER_WINDOW]
-    _user_inf_attempts[prefix] = attempts
-
-    if len(attempts) >= INF_USER_LIMIT:
-        return False
-
-    _user_inf_attempts[prefix].append(now)
-
-    return True
+    '''Check per-user rate limit for inference requests (keyed by API prefix).'''
+    return _check_rate_limit(_user_inf_attempts, prefix, INF_USER_LIMIT, INF_USER_WINDOW)
 
 
 def _fmt_tokens(n: int) -> str:
@@ -310,26 +304,26 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
-async def authenticate(request: Request) -> tuple[User, AsyncSession] | tuple[None, None]:
+async def authenticate(request: Request) -> tuple[User, AsyncSession] | None:
     '''Validate the Bearer token from the request Authorization header.
 
     Args:
         request: Incoming FastAPI request.
 
     Returns:
-        (user, session) if the key is valid, (None, None) otherwise.
+        (user, session) if the key is valid, None otherwise.
         The session is left open for the caller to commit and close.
     '''
 
     auth = request.headers.get('Authorization', '')
 
     if not auth.startswith('Bearer '):
-        return None, None
+        return None
 
     raw_key = auth.removeprefix('Bearer ').strip()
 
     if not raw_key.startswith('sk-') or len(raw_key) < 12:
-        return None, None
+        return None
 
     prefix = raw_key[:12]
     session = async_session()
@@ -337,7 +331,7 @@ async def authenticate(request: Request) -> tuple[User, AsyncSession] | tuple[No
 
     if user is None or not verify_api_key(raw_key, user.api_key_hash):
         await session.close()
-        return None, None
+        return None
 
     return user, session
 
@@ -452,20 +446,154 @@ PACKS = [
 ]
 
 
+# User dashboard sessions - in-memory only, same single-instance assumption
+# as the admin sessions below. The API key is accepted once (via the
+# ?key= login link) to establish a session; it is never carried in
+# subsequent URLs, forms, or provider redirect URLs.
+_user_sessions: dict[str, tuple[int, float]] = {}  # token -> (user_id, expiry)
+_DASH_SESSION_COOKIE = 'dashboard_session'
+_DASH_SESSION_TTL = int(os.environ.get('DASHBOARD_SESSION_TTL_SECONDS', str(12 * 3600)))
+
+# One-time tokens embedded in payment-provider return URLs (Stripe
+# success/cancel, BTCPay redirect). Consumed on first use; short-lived.
+_checkout_returns: dict[str, tuple[int, float]] = {}  # token -> (user_id, expiry)
+_CHECKOUT_RETURN_TTL = 3600
+
+
+def _prune_user_sessions(now: float | None = None) -> None:
+    '''Remove expired dashboard session and checkout-return tokens.'''
+
+    now = time.time() if now is None else now
+
+    for store in (_user_sessions, _checkout_returns):
+        for t in [t for t, (_, exp) in store.items() if exp <= now]:
+            del store[t]
+
+
+def _issue_user_session(user_id: int) -> str:
+    '''Create a new dashboard session for the given user and return its token.'''
+
+    _prune_user_sessions()
+    token = secrets.token_urlsafe(32)
+    _user_sessions[token] = (user_id, time.time() + _DASH_SESSION_TTL)
+
+    return token
+
+
+def _check_user_session(token: str | None) -> int | None:
+    '''Return the user_id for a valid dashboard session token, else None.'''
+
+    if not token:
+        return None
+
+    _prune_user_sessions()
+
+    entry = _user_sessions.get(token)
+
+    if entry is None:
+        return None
+
+    return entry[0]
+
+
+def _revoke_user_session(token: str | None) -> None:
+    '''Remove a dashboard session token, e.g. on logout.'''
+
+    if token:
+        _user_sessions.pop(token, None)
+
+
+def _issue_checkout_return(user_id: int) -> str:
+    '''Create a one-time token for a payment-provider return URL.'''
+
+    _prune_user_sessions()
+    token = secrets.token_urlsafe(32)
+    _checkout_returns[token] = (user_id, time.time() + _CHECKOUT_RETURN_TTL)
+
+    return token
+
+
+def _consume_checkout_return(token: str | None) -> int | None:
+    '''Consume a checkout-return token; returns the user_id or None.
+
+    Tokens are single-use: a consumed token is deleted, so a stale or
+    replayed return URL cannot re-open a session.
+    '''
+
+    if not token:
+        return None
+
+    _prune_user_sessions()
+    entry = _checkout_returns.pop(token, None)
+
+    if entry is None:
+        return None
+
+    return entry[0]
+
+
+def _set_user_session_cookie(response: Response, token: str) -> None:
+    '''Attach the dashboard session cookie to a response.
+
+    No explicit `secure` flag: matches the existing captcha cookie convention
+    so the cookie still works in tests (http://testserver); the production
+    domain is HTTPS-only end to end via nginx regardless.
+    '''
+
+    response.set_cookie(
+        key=_DASH_SESSION_COOKIE,
+        value=token,
+        max_age=_DASH_SESSION_TTL,
+        httponly=True,
+        samesite='lax',
+        path='/',
+    )
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request, key: str = Query(...)):
-    '''Render the user dashboard: balance, trial status, 30-day usage, and billing options.'''
+async def dashboard(request: Request, key: str | None = Query(default=None)):
+    '''Render the user dashboard: balance, trial status, 30-day usage, and billing options.
 
-    if not key.startswith('sk-') or len(key) < 12:
-        return RedirectResponse('/register')
+    Authentication: either a one-time `?key=` login (the API key is
+    validated once and a dashboard session cookie is established, then the
+    user is redirected to a key-free URL) or an existing dashboard session
+    cookie. The API key is never required in the URL after the initial
+    login.
+    '''
 
-    prefix = key[:12]
+    if key is not None:
+        # One-time key login: validate, establish a session, redirect clean.
+        user_id: int | None = None
+
+        if key.startswith('sk-') and len(key) >= 12:
+            prefix = key[:12]
+
+            async with async_session() as session:
+                user = await get_user_by_key_prefix(session, prefix)
+                user_id = user.id if (
+                    user is not None and verify_api_key(key, user.api_key_hash)
+                ) else None
+
+        if user_id is None:
+            return RedirectResponse('/', status_code=303)
+
+        token = _issue_user_session(user_id)
+        response = RedirectResponse('/dashboard', status_code=303)
+        _set_user_session_cookie(response, token)
+        return response
+
+    user_id = _check_user_session(request.cookies.get(_DASH_SESSION_COOKIE))
+
+    if user_id is None:
+        return RedirectResponse('/', status_code=303)
 
     async with async_session() as session:
-        user = await get_user_by_key_prefix(session, prefix)
-    
-        if user is None or not verify_api_key(key, user.api_key_hash):
-            return RedirectResponse('/register')
+        user = (await session.execute(
+            select(User).where(User.id == user_id)
+        )).scalar_one_or_none()
+
+        if user is None:
+            return RedirectResponse('/', status_code=303)
 
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
@@ -486,7 +614,7 @@ async def dashboard(request: Request, key: str = Query(...)):
     
         # SQLite returns datetimes as strings; PostgreSQL returns datetime objects
         if isinstance(trial_expires_raw, str):
-            trial_expires_dt = datetime.fromisoformat(trial_expires_raw).replace(
+            trial_expires_dt: datetime | None = datetime.fromisoformat(trial_expires_raw).replace(
                 tzinfo=timezone.utc
             )
         else:
@@ -510,6 +638,7 @@ async def dashboard(request: Request, key: str = Query(...)):
         )
 
         s = summary.mappings().first()
+        assert s is not None  # aggregate SELECT without GROUP BY always returns one row
         used_in, used_out, req_count = s["inp"], s["out"], s["reqs"]
 
         # Daily usage for bar chart
@@ -544,7 +673,6 @@ async def dashboard(request: Request, key: str = Query(...)):
 
     return templates.TemplateResponse(request, 'dashboard.html', {
         'email': user.email,
-        'api_key': key,                    # full key - used in buy form hidden fields
         'api_key_prefix': user.api_key_prefix,
         'total_balance': total_balance,
         'total_balance_fmt': _fmt_tokens(total_balance),
@@ -562,31 +690,58 @@ async def dashboard(request: Request, key: str = Query(...)):
     })
 
 
+@app.post("/dashboard/logout")
+async def dashboard_logout(request: Request):
+    '''End the dashboard session and redirect to the landing page.'''
+
+    _revoke_user_session(request.cookies.get(_DASH_SESSION_COOKIE))
+    response = RedirectResponse('/', status_code=303)
+    response.delete_cookie(_DASH_SESSION_COOKIE, path='/')
+    return response
+
+
 # ── Billing ──────────────────────────────────────────────────────────────────
 
-@app.get("/checkout")
+@app.post("/checkout")
 async def checkout_redirect(
-    pack: str,
-    key: str = Query(...),
-    method: str = Query(default='stripe'),   # 'stripe' | 'btcpay'
+    request: Request,
+    pack: str = Form(...),
+    method: str = Form(default='stripe'),   # 'stripe' | 'btcpay'
 ):
-    '''Validate the user's API key, create a payment session, and redirect to the provider.'''
+    '''Create a payment session for the dashboard-logged-in user and redirect
+    to the provider.
 
-    if not key.startswith('sk-') or len(key) < 12:
-        return RedirectResponse('/register')
+    Auth is the dashboard session cookie; the API key is never transmitted
+    or embedded in any URL. Provider return URLs carry a short-lived
+    one-time token (consumed at /checkout/return) instead.
+    '''
 
-    prefix = key[:12]
+    user_id = _check_user_session(request.cookies.get(_DASH_SESSION_COOKIE))
+
+    if user_id is None:
+        return RedirectResponse('/', status_code=303)
 
     async with async_session() as session:
-        user = await get_user_by_key_prefix(session, prefix)
-    
-        if user is None or not verify_api_key(key, user.api_key_hash):
-            return RedirectResponse('/register')
-    
-        user_id = user.id
+        user = (await session.execute(
+            select(User).where(User.id == user_id)
+        )).scalar_one_or_none()
+
+        if user is None:
+            return RedirectResponse('/', status_code=303)
+
         user_email = user.email
 
-    base_url = os.environ.get('BASE_URL', 'http://localhost:8503')
+    base_url = os.environ.get('BASE_URL', '').rstrip('/')
+
+    if not base_url:
+        log.error('Checkout requested but BASE_URL is not set')
+        return JSONResponse(
+            status_code=503,
+            content={'error': 'Payment system not configured.'}
+        )
+
+    return_token = _issue_checkout_return(user_id)
+    base_return = f'{base_url}/checkout/return?token={return_token}'
 
     try:
         if method == 'btcpay':
@@ -594,16 +749,15 @@ async def checkout_redirect(
                 pack_id=pack,
                 user_id=user_id,
                 user_email=user_email,
-                full_key=key,
-                base_url=base_url,
+                redirect_url=f'{base_return}&status=success',
             )
         else:
             checkout_url = await create_checkout_session(
                 pack_id=pack,
                 user_id=user_id,
                 user_email=user_email,
-                full_key=key,
-                base_url=base_url,
+                success_url=f'{base_return}&status=success',
+                cancel_url=base_return,
             )
     except ValueError as exc:
         return JSONResponse(
@@ -627,8 +781,33 @@ async def checkout_redirect(
             content={'error': 'Could not create checkout session.'}
         )
 
-
     return RedirectResponse(checkout_url, status_code=303)
+
+
+@app.get("/checkout/return")
+async def checkout_return(
+    request: Request,
+    token: str = Query(...),
+    status: str = Query(default=''),
+):
+    '''Landing route after a payment provider redirects back.
+
+    Consumes the one-time return token, re-establishes the dashboard
+    session, and forwards to the dashboard (with a payment-success flash
+    when the provider reports success). Actual token crediting happens
+    asynchronously in the provider webhook.
+    '''
+
+    user_id = _consume_checkout_return(token)
+
+    if user_id is None:
+        return RedirectResponse('/', status_code=303)
+
+    session_token = _issue_user_session(user_id)
+    target = '/dashboard?payment=success' if status == 'success' else '/dashboard'
+    response = RedirectResponse(target, status_code=303)
+    _set_user_session_cookie(response, session_token)
+    return response
 
 
 @app.post("/btcpay/webhook")
@@ -991,12 +1170,13 @@ async def responses_api(request: Request):
             }},
         )
 
-    user, session = await authenticate(request)
-    if user is None:
+    auth = await authenticate(request)
+    if auth is None:
         return JSONResponse(
             status_code=401,
             content={'error': {'message': 'Invalid or missing API key.', 'type': 'auth_error'}},
         )
+    user, session = auth
 
     if not _check_user_inference_rate_limit(user.api_key_prefix):
         await session.close()
@@ -1024,6 +1204,13 @@ async def responses_api(request: Request):
         await session.close()
         return _responses_error(str(exc))
 
+    if _MODEL_ALLOWLIST and chat_body.get('model') not in _MODEL_ALLOWLIST:
+        await session.close()
+        return _responses_error(
+            f"Model {chat_body.get('model')!r} is not available. Available models: "
+            + ', '.join(sorted(_MODEL_ALLOWLIST))
+        )
+
     async with session:
         available = await total_available_tokens(session, user)
         if available <= 0:
@@ -1031,8 +1218,8 @@ async def responses_api(request: Request):
                 status_code=402,
                 content={
                     'error': {
-                        'message': 'Insufficient token balance. Purchase more tokens at '
-                                   f"{os.environ.get('BASE_URL', '')}/buy",
+                        'message': 'Insufficient token balance. Top-ups are coming soon; '
+                                   f'manage your account at {os.environ.get("BASE_URL", "")}/dashboard',
                         'type': 'insufficient_quota',
                     }
                 },
@@ -1158,13 +1345,14 @@ async def proxy(request: Request, path: str):
             }},
         )
 
-    user, session = await authenticate(request)
+    auth = await authenticate(request)
 
-    if user is None:
+    if auth is None:
         return JSONResponse(
-                status_code=401,
-                content={'error': {'message': 'Invalid or missing API key.', 'type': 'auth_error'}},
-            )
+            status_code=401,
+            content={'error': {'message': 'Invalid or missing API key.', 'type': 'auth_error'}},
+        )
+    user, session = auth
 
     if not _check_user_inference_rate_limit(user.api_key_prefix):
         await session.close()
@@ -1186,8 +1374,8 @@ async def proxy(request: Request, path: str):
                 status_code=402,
                 content={
                     'error': {
-                        'message': 'Insufficient token balance. Purchase more tokens at '
-                               f"{os.environ.get('BASE_URL', '')}/buy",
+                        'message': 'Insufficient token balance. Top-ups are coming soon; '
+                               f'manage your account at {os.environ.get("BASE_URL", "")}/dashboard',
                         'type': 'insufficient_quota',
                     }
                 },
@@ -1205,16 +1393,40 @@ async def proxy(request: Request, path: str):
                     content={'error': {'message': 'Invalid JSON body.'}}
                 )
 
-        is_stream = isinstance(body, dict) and body.get('stream', False)
         forward_path = f"/{path}"
         method = request.method
         headers = dict(request.headers)
 
-        if is_stream:
+        # Chat completions: default a missing/empty model to the pinned
+        # default alias, and (if MODEL_ALLOWLIST is configured) reject
+        # models outside the public allow-list with a clear 400.
+        if (
+            request.method == 'POST'
+            and isinstance(body, dict)
+            and forward_path.lstrip('/').startswith('chat/completions')
+        ):
+            model = body.get('model')
+            if not isinstance(model, str) or not model:
+                model = DEFAULT_MODEL
+
+            if _MODEL_ALLOWLIST and model not in _MODEL_ALLOWLIST:
+                return JSONResponse(
+                    status_code=400,
+                    content={'error': {
+                        'message': (
+                            f"Model {model!r} is not available. Available models: "
+                            + ', '.join(sorted(_MODEL_ALLOWLIST))
+                        ),
+                        'type': 'invalid_request_error',
+                    }},
+                )
+
+            body['model'] = model
+
+        if isinstance(body, dict) and body.get('stream', False):
             return await _handle_stream(session, user, method, forward_path, headers, body)
 
-        else:
-            return await _handle_standard(session, user, method, forward_path, headers, body)
+        return await _handle_standard(session, user, method, forward_path, headers, body)
 
 
 async def _handle_standard(
@@ -1321,9 +1533,12 @@ def _admin_key() -> str:
     return os.environ.get('ADMIN_KEY', '')
 
 
-# CIDRs allowed to reach /admin - tailnet + localhost + Docker bridge.
+# CIDRs allowed to reach /admin - tailnet + localhost + the Docker NAT
+# source for operator access from the gateway host (Docker allocates
+# user-defined networks from 172.16.0.0/12, typically 172.17.0.0/16; if
+# this stack's network got a different subnet, set ADMIN_ALLOWED_CIDRS).
 # Override via ADMIN_ALLOWED_CIDRS env var (comma-separated) if needed.
-_DEFAULT_ADMIN_CIDRS = ["100.64.0.0/10", "127.0.0.1/32", "::1/128", "172.16.0.0/12"]
+_DEFAULT_ADMIN_CIDRS = ["100.64.0.0/10", "127.0.0.1/32", "::1/128", "172.17.0.0/16"]
 
 def _admin_allowed_cidrs() -> list[str]:
     '''Return the list of CIDRs permitted to access the admin panel.
@@ -1530,7 +1745,7 @@ async def admin_panel(request: Request):
             ),
             {"since": thirty_days_ago},
         )
-        tokens_30d = tokens_30d_r.scalar()
+        tokens_30d = int(tokens_30d_r.scalar() or 0)
 
         user_list = []
     
@@ -1540,14 +1755,14 @@ async def admin_panel(request: Request):
             paid_tokens = u.balance_tokens
             last_req = last_request_map.get(u.id)
             if isinstance(last_req, str):
-                last_req_dt = datetime.fromisoformat(last_req).replace(tzinfo=timezone.utc)
+                last_req_dt: datetime | None = datetime.fromisoformat(last_req).replace(tzinfo=timezone.utc)
             else:
                 last_req_dt = last_req
 
             # exp is null when a user has grant history but no currently active grant
             trial_exp = tr['exp'] if tr else None
             if isinstance(trial_exp, str):
-                trial_exp_dt = datetime.fromisoformat(trial_exp)
+                trial_exp_dt: datetime | None = datetime.fromisoformat(trial_exp)
             else:
                 trial_exp_dt = trial_exp
 

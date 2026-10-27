@@ -55,8 +55,7 @@ async def create_invoice(
     pack_id: str,
     user_id: int,
     user_email: str,
-    full_key: str,
-    base_url: str,
+    redirect_url: str,
 ) -> tuple[str, str]:
     '''Create a BTCPay invoice for the given token pack.
 
@@ -64,8 +63,9 @@ async def create_invoice(
         pack_id: Key in PACK_CATALOG (e.g. "5m", "25m", "100m").
         user_id: Database ID of the purchasing user.
         user_email: Stored in the invoice metadata for reporting.
-        full_key: Full API key, embedded in the success redirect URL.
-        base_url: Public base URL of this gateway (e.g. https://example.com).
+        redirect_url: Where BTCPay redirects after settlement. Must NOT
+            contain the user's API key - use the short-lived return token
+            flow.
 
     Returns:
         A tuple of (invoice_id, checkout_url).
@@ -95,7 +95,7 @@ async def create_invoice(
             'buyerEmail': user_email,
         },
         'checkout': {
-            'redirectURL': f'{base_url}/dashboard?key={full_key}&payment=success',
+            'redirectURL': redirect_url,
             'redirectAutomatically': True,
         },
     }

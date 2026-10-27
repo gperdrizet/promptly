@@ -257,26 +257,237 @@ async def test_responses_streaming_translates_chat_sse(client: AsyncClient, regi
     assert 'Hello world' in r.text
 
 
+# --- Model selection (default + opt-in) ---
+
+
+@pytest.mark.parametrize('payload', [
+    pytest.param(
+        {'messages': [{'role': 'user', 'content': 'Hello!'}]},
+        id='model-missing',
+    ),
+    pytest.param(
+        {'model': '', 'messages': [{'role': 'user', 'content': 'Hello!'}]},
+        id='model-empty',
+    ),
+])
+async def test_chat_missing_or_empty_model_defaults_to_pinned_default(
+    client: AsyncClient, registered_user, monkeypatch, payload
+):
+    '''A missing or empty `model` is replaced with the pinned default alias
+    before the request is forwarded to the backend.'''
+
+    import httpx
+    import app.app as gateway_app
+
+    async def fake_proxy_request(method, path, headers, body):
+        assert body['model'] == 'default'
+
+        return (
+            httpx.Response(200, json={
+                'id': 'chatcmpl_test123',
+                'created': 1234567890,
+                'model': 'Qwen3.8-27B-UD-Q4_K_M.gguf',
+                'choices': [{
+                    'index': 0,
+                    'message': {'role': 'assistant', 'content': 'Hello back!'},
+                    'finish_reason': 'stop',
+                }],
+                'usage': {
+                    'prompt_tokens': 5,
+                    'completion_tokens': 2,
+                    'total_tokens': 7,
+                },
+            }),
+            5,
+            2,
+        )
+
+    monkeypatch.setattr(gateway_app, 'proxy_request', fake_proxy_request)
+
+    r = await client.post(
+        '/v1/chat/completions',
+        headers={'Authorization': f'Bearer {registered_user["key"]}'},
+        json=payload,
+    )
+
+    assert r.status_code == 200
+    assert r.json()['model'] == 'Qwen3.8-27B-UD-Q4_K_M.gguf'
+
+
+async def test_chat_allowlist_rejects_unknown_model(client: AsyncClient, registered_user, monkeypatch):
+    '''With MODEL_ALLOWLIST set, a model outside the list is rejected with a
+    clear 400 and never reaches the backend.'''
+
+    import app.app as gateway_app
+
+    monkeypatch.setattr(gateway_app, '_MODEL_ALLOWLIST', {'default', 'Qwen3.8-27B'})
+
+    r = await client.post(
+        '/v1/chat/completions',
+        headers={'Authorization': f'Bearer {registered_user["key"]}'},
+        json={'model': 'Qwen3.5-9B', 'messages': [{'role': 'user', 'content': 'Hello!'}]},
+    )
+
+    assert r.status_code == 400
+    error = r.json()['error']
+    assert error['type'] == 'invalid_request_error'
+    assert 'not available' in error['message']
+    assert 'Qwen3.8-27B' in error['message']
+
+
+async def test_chat_allowlist_passes_known_model(client: AsyncClient, registered_user, monkeypatch):
+    '''A model inside MODEL_ALLOWLIST is forwarded to the backend unchanged.'''
+
+    import httpx
+    import app.app as gateway_app
+
+    async def fake_proxy_request(method, path, headers, body):
+        assert body['model'] == 'Qwen3.8-27B'
+
+        return (
+            httpx.Response(200, json={
+                'id': 'chatcmpl_test123',
+                'created': 1234567890,
+                'model': 'Qwen3.8-27B-UD-Q4_K_M.gguf',
+                'choices': [{
+                    'index': 0,
+                    'message': {'role': 'assistant', 'content': 'Hello back!'},
+                    'finish_reason': 'stop',
+                }],
+                'usage': {
+                    'prompt_tokens': 5,
+                    'completion_tokens': 2,
+                    'total_tokens': 7,
+                },
+            }),
+            5,
+            2,
+        )
+
+    monkeypatch.setattr(gateway_app, '_MODEL_ALLOWLIST', {'default', 'Qwen3.8-27B'})
+    monkeypatch.setattr(gateway_app, 'proxy_request', fake_proxy_request)
+
+    r = await client.post(
+        '/v1/chat/completions',
+        headers={'Authorization': f'Bearer {registered_user["key"]}'},
+        json={'model': 'Qwen3.8-27B', 'messages': [{'role': 'user', 'content': 'Hello!'}]},
+    )
+
+    assert r.status_code == 200
+
+
+async def test_responses_allowlist_rejects_unknown_model(client: AsyncClient, registered_user, monkeypatch):
+    '''The /v1/responses shim enforces the same model allow-list.'''
+
+    import app.app as gateway_app
+
+    monkeypatch.setattr(gateway_app, '_MODEL_ALLOWLIST', {'default', 'Qwen3.8-27B'})
+
+    r = await client.post(
+        '/v1/responses',
+        headers={'Authorization': f'Bearer {registered_user["key"]}'},
+        json={'model': 'Qwen3.5-9B', 'input': 'Hello!'},
+    )
+
+    assert r.status_code == 400
+    assert 'not available' in r.json()['error']['message']
+
+
+async def test_models_list_proxied_to_backend(client: AsyncClient, registered_user, monkeypatch):
+    '''GET /v1/models is authenticated and passed through from the backend.'''
+
+    import httpx
+    import app.app as gateway_app
+
+    async def fake_proxy_request(method, path, headers, body):
+        assert method == 'GET'
+        assert path == '/models'
+        assert body is None
+
+        return (
+            httpx.Response(200, json={
+                'object': 'list',
+                'data': [
+                    {'id': 'default', 'object': 'model'},
+                    {'id': 'Qwen3.8-27B', 'object': 'model'},
+                ],
+            }),
+            0,
+            0,
+        )
+
+    monkeypatch.setattr(gateway_app, 'proxy_request', fake_proxy_request)
+
+    r = await client.get(
+        '/v1/models',
+        headers={'Authorization': f'Bearer {registered_user["key"]}'},
+    )
+
+    assert r.status_code == 200
+    ids = [m['id'] for m in r.json()['data']]
+    assert 'default' in ids
+    assert 'Qwen3.8-27B' in ids
+
+
 # --- Dashboard ---
 
 async def test_dashboard_valid_key(client: AsyncClient, registered_user):
-    '''Dashboard returns 200 and shows the user email when a valid key is supplied.'''
+    '''A valid key logs the user in: the one-time ?key= login redirects to a
+    key-free URL and the dashboard renders from the session cookie.'''
 
-    r = await client.get(f'/dashboard?key={registered_user["key"]}')
+    r = await client.get(f'/dashboard?key={registered_user["key"]}', follow_redirects=True)
 
     assert r.status_code == 200
+    assert registered_user['key'] not in str(r.url)
     assert registered_user['email'].encode() in r.content
 
 
 async def test_dashboard_bad_key_redirects(client: AsyncClient, _db_session):
-    '''Dashboard redirects to registration when an invalid key is supplied.'''
+    '''Dashboard redirects to the landing page when an invalid key is supplied.'''
 
     r = await client.get(
         '/dashboard?key=sk-notavalidkey12345678901234567890',
         follow_redirects=False,
     )
 
-    assert r.status_code in (302, 307)
+    assert r.status_code in (302, 303)
+    assert r.headers['location'] == '/'
+
+
+async def test_dashboard_requires_session(client: AsyncClient, _db_session):
+    '''GET /dashboard with no session cookie redirects to the landing page.'''
+
+    r = await client.get('/dashboard', follow_redirects=False)
+
+    assert r.status_code in (302, 303)
+    assert r.headers['location'] == '/'
+
+
+async def test_dashboard_session_renders_without_key(client: AsyncClient, registered_user):
+    '''Once logged in, the dashboard renders from the cookie alone.'''
+
+    await client.get(f'/dashboard?key={registered_user["key"]}', follow_redirects=False)
+
+    r = await client.get('/dashboard')
+
+    assert r.status_code == 200
+    assert registered_user['email'].encode() in r.content
+    assert registered_user['key'] not in r.text
+
+
+async def test_dashboard_logout_revokes_session(client: AsyncClient, registered_user):
+    '''POST /dashboard/logout ends the session; the next /dashboard redirects.'''
+
+    await client.get(f'/dashboard?key={registered_user["key"]}', follow_redirects=False)
+
+    r = await client.post('/dashboard/logout', follow_redirects=False)
+
+    assert r.status_code in (302, 303)
+
+    r = await client.get('/dashboard', follow_redirects=False)
+
+    assert r.status_code in (302, 303)
+    assert r.headers['location'] == '/'
 
 
 # --- Admin panel ---
@@ -401,14 +612,35 @@ async def test_admin_delete_user(client: AsyncClient, registered_user):
         assert user is None
 
 
-# --- Checkout (payment providers not configured, returns 503) ---
+# --- Checkout (session-based; no API key in any URL) ---
+
+
+async def _login_dashboard(client: AsyncClient, key: str):
+    '''Establish a dashboard session via the one-time ?key= login.'''
+
+    r = await client.get(f'/dashboard?key={key}', follow_redirects=False)
+    assert r.status_code in (302, 303)
+    assert r.headers['location'] == '/dashboard'
+
+
+async def test_checkout_requires_session(client: AsyncClient, _db_session):
+    '''POST /checkout without a dashboard session redirects to the landing page.'''
+
+    r = await client.post(
+        '/checkout', data={'pack': '5m', 'method': 'stripe'}, follow_redirects=False,
+    )
+
+    assert r.status_code in (302, 303)
+    assert r.headers['location'] == '/'
+
 
 async def test_checkout_stripe_not_configured(client: AsyncClient, registered_user):
     '''Checkout returns 503 when Stripe is not configured (placeholder keys).'''
 
-    r = await client.get(
-        f'/checkout?pack=5m&key={registered_user["key"]}&method=stripe',
-        follow_redirects=False,
+    await _login_dashboard(client, registered_user['key'])
+
+    r = await client.post(
+        '/checkout', data={'pack': '5m', 'method': 'stripe'}, follow_redirects=False,
     )
 
     assert r.status_code == 503
@@ -417,9 +649,10 @@ async def test_checkout_stripe_not_configured(client: AsyncClient, registered_us
 async def test_checkout_btcpay_not_configured(client: AsyncClient, registered_user):
     '''Checkout returns 503 when BTCPay is not configured (placeholder keys).'''
 
-    r = await client.get(
-        f'/checkout?pack=5m&key={registered_user["key"]}&method=btcpay',
-        follow_redirects=False,
+    await _login_dashboard(client, registered_user['key'])
+
+    r = await client.post(
+        '/checkout', data={'pack': '5m', 'method': 'btcpay'}, follow_redirects=False,
     )
 
     assert r.status_code == 503
@@ -428,9 +661,230 @@ async def test_checkout_btcpay_not_configured(client: AsyncClient, registered_us
 async def test_checkout_invalid_pack(client: AsyncClient, registered_user):
     '''Checkout rejects an unknown pack identifier with 400 or 503.'''
 
-    r = await client.get(
-        f'/checkout?pack=999zz&key={registered_user["key"]}&method=stripe',
-        follow_redirects=False,
+    await _login_dashboard(client, registered_user['key'])
+
+    r = await client.post(
+        '/checkout', data={'pack': '999zz', 'method': 'stripe'}, follow_redirects=False,
     )
 
     assert r.status_code in (400, 503)
+
+
+async def test_checkout_return_urls_carry_token_not_key(client: AsyncClient, registered_user, monkeypatch):
+    '''Provider return URLs contain a one-time token, never the API key;
+    the token re-opens a dashboard session and is single-use.'''
+
+    import app.app as gateway_app
+
+    captured: dict[str, str] = {}
+
+    async def fake_create_checkout_session(pack_id, user_id, user_email, success_url, cancel_url):
+        captured['success_url'] = success_url
+        captured['cancel_url'] = cancel_url
+        return 'https://stripe.example/checkout/test'
+
+    monkeypatch.setattr(gateway_app, 'create_checkout_session', fake_create_checkout_session)
+
+    await _login_dashboard(client, registered_user['key'])
+
+    r = await client.post(
+        '/checkout', data={'pack': '5m', 'method': 'stripe'}, follow_redirects=False,
+    )
+
+    assert r.status_code == 303
+    assert 'stripe.example' in r.headers['location']
+    assert registered_user['key'] not in captured['success_url']
+    assert registered_user['key'] not in captured['cancel_url']
+
+    token = re.search(r'token=([A-Za-z0-9_\-]+)', captured['success_url'])
+    assert token is not None
+
+    # Provider redirects back: token is consumed, session re-established.
+    r = await client.get(
+        f'/checkout/return?token={token.group(1)}&status=success',
+        follow_redirects=False,
+    )
+
+    assert r.status_code in (302, 303)
+    assert r.headers['location'] == '/dashboard?payment=success'
+
+    r = await client.get('/dashboard')
+
+    assert r.status_code == 200
+    assert registered_user['email'].encode() in r.content
+
+    # Replaying the same token does not re-open a session.
+    r = await client.get(f'/checkout/return?token={token.group(1)}', follow_redirects=False)
+
+    assert r.status_code in (302, 303)
+    assert r.headers['location'] == '/'
+
+
+# --- Streaming (main proxy) ---
+
+async def test_chat_streaming_proxies_sse_and_records_usage(client: AsyncClient, registered_user, monkeypatch):
+    '''POST /v1/chat/completions with stream:true passes the backend SSE
+    chunks through unchanged and records token usage when the stream ends.'''
+
+    import app.app as gateway_app
+    from app.db import engine, TrialTokens
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    async def fake_proxy_stream(method, path, headers, body):
+        assert method == 'POST'
+        assert path == '/chat/completions'
+        assert body['stream'] is True
+        assert body['model'] == 'default'
+        yield (
+            b'data: {"id":"chatcmpl_1","model":"Qwen3.8-27B-UD-Q4_K_M.gguf",'
+            b'"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+            0,
+            0,
+        )
+        yield (
+            b'data: {"id":"chatcmpl_1","model":"Qwen3.8-27B-UD-Q4_K_M.gguf",'
+            b'"choices":[{"delta":{"content":" world"}}]}\n\n',
+            0,
+            0,
+        )
+        yield (
+            b'data: {"id":"chatcmpl_1","model":"Qwen3.8-27B-UD-Q4_K_M.gguf",'
+            b'"choices":[{"delta":{},"finish_reason":"stop"}],'
+            b'"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n',
+            4,
+            2,
+        )
+        yield b'data: [DONE]\n\n', 0, 0
+
+    monkeypatch.setattr(gateway_app, 'proxy_stream', fake_proxy_stream)
+
+    r = await client.post(
+        '/v1/chat/completions',
+        headers={'Authorization': f'Bearer {registered_user["key"]}'},
+        json={
+            'model': 'default',
+            'messages': [{'role': 'user', 'content': 'Hello!'}],
+            'stream': True,
+        },
+    )
+
+    assert r.status_code == 200
+    assert r.headers['content-type'].startswith('text/event-stream')
+    assert 'Hello' in r.text
+    assert ' world' in r.text
+    assert '[DONE]' in r.text
+
+    # Usage was recorded once the stream ended.
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_maker() as session:
+        trial = (await session.execute(
+            select(TrialTokens).where(TrialTokens.user_id == registered_user['id'])
+        )).scalars().first()
+
+        assert trial is not None
+        assert trial.remaining_tokens == 500_000 - 6
+
+
+# --- Rate limiting ---
+
+async def test_ip_rate_limit_returns_429(client: AsyncClient, _db_session, monkeypatch):
+    '''Requests from one IP over the per-IP inference limit get 429; the IP
+    limiter runs before auth, so unauthenticated requests count too.'''
+
+    import app.app as gateway_app
+
+    monkeypatch.setattr(gateway_app, 'INF_IP_LIMIT', 3)
+
+    for _ in range(3):
+        r = await client.post('/v1/chat/completions', json={'model': 'x', 'messages': []})
+        assert r.status_code == 401
+
+    r = await client.post('/v1/chat/completions', json={'model': 'x', 'messages': []})
+
+    assert r.status_code == 429
+    assert r.json()['error']['type'] == 'rate_limit_error'
+
+
+async def test_user_rate_limit_returns_429(client: AsyncClient, registered_user, monkeypatch):
+    '''Authenticated requests over the per-user limit get 429.'''
+
+    import httpx
+    import app.app as gateway_app
+
+    monkeypatch.setattr(gateway_app, 'INF_USER_LIMIT', 3)
+
+    async def fake_proxy_request(method, path, headers, body):
+        return (
+            httpx.Response(200, json={
+                'id': 'chatcmpl_test123',
+                'created': 1234567890,
+                'model': 'Qwen3.8-27B-UD-Q4_K_M.gguf',
+                'choices': [{
+                    'index': 0,
+                    'message': {'role': 'assistant', 'content': 'ok'},
+                    'finish_reason': 'stop',
+                }],
+                'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2},
+            }),
+            1,
+            1,
+        )
+
+    monkeypatch.setattr(gateway_app, 'proxy_request', fake_proxy_request)
+
+    for _ in range(3):
+        r = await client.post(
+            '/v1/chat/completions',
+            headers={'Authorization': f'Bearer {registered_user["key"]}'},
+            json={'model': 'default', 'messages': [{'role': 'user', 'content': 'hi'}]},
+        )
+        assert r.status_code == 200
+
+    r = await client.post(
+        '/v1/chat/completions',
+        headers={'Authorization': f'Bearer {registered_user["key"]}'},
+        json={'model': 'default', 'messages': [{'role': 'user', 'content': 'hi'}]},
+    )
+
+    assert r.status_code == 429
+    assert r.json()['error']['type'] == 'rate_limit_error'
+
+
+async def test_rate_limit_sweeps_stale_keys():
+    '''The shared limiter drops keys whose window has fully passed, so the
+    in-memory store cannot grow without bound as IPs/users come and go.'''
+
+    import time
+    import app.app as gateway_app
+
+    store = {
+        'stale-ip': [time.time() - 7200],  # older than the 60s window
+        'fresh-ip': [time.time() - 10],
+    }
+
+    # A first check against an unseen store triggers the periodic sweep.
+    assert gateway_app._check_rate_limit(store, 'new-ip', 10, 60) is True
+
+    assert 'stale-ip' not in store
+    assert 'fresh-ip' in store
+    assert store['new-ip']
+
+
+async def test_rate_limit_enforces_window():
+    '''Within the window the limit is enforced; once the window passes,
+    requests are allowed again.'''
+
+    import time
+    import app.app as gateway_app
+
+    store = {}
+
+    assert gateway_app._check_rate_limit(store, 'ip', 2, 60) is True
+    assert gateway_app._check_rate_limit(store, 'ip', 2, 60) is True
+    assert gateway_app._check_rate_limit(store, 'ip', 2, 60) is False
+
+    # Simulate the window expiring.
+    store['ip'] = [time.time() - 120]
+
+    assert gateway_app._check_rate_limit(store, 'ip', 2, 60) is True

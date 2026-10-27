@@ -46,7 +46,7 @@ In VS Code, open the model picker in the Chat view and select **Manage Language 
 
 6. Save the file, then select **Promptly** from the model picker in chat.
 
-Promptly ignores whatever `id`/model name you send and always serves whichever model is currently loaded, so `"id": "default"` works regardless of backend changes.
+The `"id": "default"` entry selects the pinned default model, which keeps working regardless of backend catalog changes. To pin a specific model instead, add another entry to `models` with that model's exact name from `GET /v1/models` (expect a load delay the first time you switch to it, since the backend holds one model resident at a time).
 
 > If the model doesn't appear right away, restart VS Code.
 

@@ -32,11 +32,13 @@ Click **Verify** (or equivalent) to confirm the connection works before starting
 
 ## What you're actually talking to
 
-- **Model:** whichever model is currently loaded (query `/v1/models`); currently a Qwen3 reasoning model
-- **Reasoning:** the model thinks by default and returns its chain-of-thought in `reasoning_content`; those thinking tokens bill the same as regular output. Disable thinking by sending `chat_template_kwargs: {"enable_thinking": false}`.
+- **Model:** the model you request. The `default` ID above selects the pinned default model (currently a Qwen3 reasoning model); send any other name from `GET /v1/models` to use that model instead.
+- **Reasoning:** reasoning models think by default and return their chain-of-thought in `reasoning_content`; those thinking tokens bill the same as regular output. Disable thinking by sending `chat_template_kwargs: {"enable_thinking": false}`.
+
+**Latency note:** the backend holds one model resident at a time. Switching to a model that isn't currently loaded pays its load time (a few seconds for small models, several minutes for the largest ones), and the first request after 5 minutes of silence is always a cold load. Leave Cline on `default` for steady workloads.
 
 ## Notes
 
-- Promptly ignores whatever `model` field you send and always serves whichever model is currently loaded, so the `default` model ID above will keep working if the backend changes.
-- Cline's OpenAI Compatible provider forwards your request body largely as-is, so extra fields like `chat_template_kwargs` reach the backend. (A top-level `reasoning_effort` field is ignored by the current Qwen model; to set reasoning depth pass `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}`, and use `enable_thinking` as above to turn thinking off.)
+- The `model` field is honored: `default` always maps to the pinned default model, so it keeps working even as the backend catalog changes. If you want a specific model, use its exact name from `GET /v1/models` — and expect a load delay the first time you switch to it.
+- Cline's OpenAI Compatible provider forwards your request body largely as-is, so extra fields like `chat_template_kwargs` reach the backend. (A top-level `reasoning_effort` field is ignored by the Qwen models; to set reasoning depth pass `chat_template_kwargs: {"reasoning_effort": "low|medium|high|xhigh"}`, and use `enable_thinking` as above to turn thinking off.)
 - Check your token balance any time at `https://promptlyapi.com/dashboard?key=sk-your-key-here`.
